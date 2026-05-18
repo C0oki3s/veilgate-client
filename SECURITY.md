@@ -72,30 +72,10 @@ You will receive a response within **48 hours** and a patch within **7 days** fo
 
 ---
 
-## npm Publishing
-
-Both packages are published under the `@veilgate` npm scope.
-
-```bash
-# Authenticate
-npm login
-
-# Build and test
-cd packages/browser && npm run build && npm test
-cd ../node && npm run build && npm test
-
-# Publish
-cd packages/browser && npm publish --access public
-cd ../node && npm publish --access public
-```
-
-**Never publish with `--force` or skip the test step.**
-
----
-
 ## GitHub Repository
 
-- **SDK monorepo:** https://github.com/C0oki3s/veilgate-sdk
+- **Browser SDK:** https://github.com/C0oki3s/veilgate-client
+- **Node SDK:** https://github.com/C0oki3s/veilgate-node
 - **Main VeilGate server:** https://github.com/C0oki3s/veilgate
 - **npm `@veilgate/client`:** https://www.npmjs.com/package/@veilgate/client
 - **npm `@veilgate/node`:** https://www.npmjs.com/package/@veilgate/node
