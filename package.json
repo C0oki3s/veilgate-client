@@ -37,7 +37,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/C0oki3s/veilgate-client.git"
+    "url": "git+https://github.com/C0oki3s/veilgate-client.git"
   },
   "keywords": [
     "veilgate",
