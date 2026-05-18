@@ -1,0 +1,49 @@
+{
+  "name": "@veilgate/client",
+  "version": "0.1.0",
+  "description": "Browser SDK for VeilGate — auto-attach credentials and handle PoW challenges with a two-liner",
+  "main": "dist/client.cjs.js",
+  "module": "dist/client.esm.js",
+  "browser": "dist/client.umd.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/client.esm.js",
+      "require": "./dist/client.cjs.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rollup -c && tsc --emitDeclarationOnly --outDir dist",
+    "dev": "rollup -c -w",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^11.1.6",
+    "rollup": "^4.13.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0",
+    "jsdom": "^24.0.0",
+    "@types/node": "^20.12.7"
+  },
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/C0oki3s/veilgate-client.git"
+  },
+  "keywords": [
+    "veilgate",
+    "security",
+    "proof-of-work",
+    "challenge",
+    "bot-detection"
+  ]
+}
