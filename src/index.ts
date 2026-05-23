@@ -38,6 +38,49 @@ export interface VeilGateOptions {
    * or a fresh solve). Useful for logging or custom token propagation.
    */
   onToken?: (token: string, header: string) => void;
+
+  /**
+   * Defensive agent-decoy material for SPA/bundle-mining scanners.
+   *
+   * When enabled the SDK injects a runtime-randomized metadata block into
+   * the DOM and exposes a non-enumerable window hint. Browser users never
+   * see it, but agents that scrape DOM/source/bundle content discover
+   * realistic endpoint breadcrumbs that route to VeilGate's tarpit.
+   *
+   * Paths are sourced from the /__veilgate/.well-known tarpit block first
+   * (set by the proxy operator) so every breadcrumb maps to a path the
+   * server is actively tarpitting. Falls back to built-in defaults when
+   * the server hasn't configured decoy_paths.
+   *
+   * Set false to disable. Default: true.
+   */
+  agentDecoys?: boolean | AgentDecoyOptions;
+}
+
+export interface AgentDecoyOptions {
+  /** Enable/disable all decoys. Default: true. */
+  enabled?: boolean;
+
+  /** Prefix for bait API paths injected into the manifest. Default: "/api". */
+  apiBase?: string;
+
+  /** How many endpoint hints to expose per page load. Default: 5. */
+  endpointCount?: number;
+
+  /** DOM id prefix for injected script/meta tags. Random suffix appended per load. */
+  elementPrefix?: string;
+
+  /**
+   * Override the endpoint pool entirely. When omitted the SDK uses the
+   * server-provided tarpit paths from .well-known, or the built-in pool.
+   */
+  endpoints?: string[];
+}
+
+export interface TarpitPathEntry {
+  path: string;
+  /** Human-readable service label set by the proxy operator, e.g. "vault", "stripe". */
+  service?: string;
 }
 
 export interface DiscoveryDoc {
@@ -54,6 +97,14 @@ export interface DiscoveryDoc {
     name?: string;
     validator?: string;
   }>;
+  /**
+   * Bait endpoints the proxy is actively tarpitting. When present the SDK
+   * uses these paths as DOM decoys so every agent breadcrumb routes to a
+   * realistic tarpit response rather than a real 404.
+   */
+  tarpit?: {
+    paths: TarpitPathEntry[];
+  };
 }
 
 export interface StoredToken {
@@ -77,6 +128,7 @@ let _opts: Required<VeilGateOptions> = {
   storageKey: DEFAULT_STORAGE_KEY,
   onChallenge: () => undefined,
   onToken: () => undefined,
+  agentDecoys: true,
 };
 
 let _discovery: DiscoveryDoc | null = null;
@@ -99,6 +151,7 @@ let _solvePromise: Promise<StoredToken> | null = null;
 export async function init(opts?: VeilGateOptions): Promise<void> {
   _mergeOpts(opts);
   _discovery = await _ensureDiscovery();
+  _installAgentDecoys();
 }
 
 /**
@@ -113,6 +166,7 @@ export function handleAll(opts?: VeilGateOptions): void {
   _mergeOpts(opts);
   _patchFetch();
   _patchXHR();
+  _installAgentDecoys();
 }
 
 /**
@@ -134,6 +188,53 @@ export async function getToken(): Promise<StoredToken> {
  */
 export function getDiscovery(): DiscoveryDoc | null {
   return _discovery;
+}
+
+/**
+ * Enable, disable, or reconfigure agent decoys at runtime.
+ *
+ * - `updateDecoys(false)` — remove injected DOM elements and disable decoys.
+ *   Subsequent calls to init() / handleAll() will not re-inject.
+ * - `updateDecoys(true)` — re-enable and (re-)inject decoys immediately.
+ * - `updateDecoys({ endpointCount: 8, endpoints: [...] })` — merge new options,
+ *   tear down the current DOM elements, and re-inject with the new config.
+ *
+ * This is safe to call at any time — before or after init() / handleAll().
+ *
+ * ```ts
+ * // Kill the decoys for this session (e.g. authenticated admin user).
+ * updateDecoys(false);
+ *
+ * // Swap in a custom endpoint list at runtime.
+ * updateDecoys({ endpoints: ["/internal/rpc", "/v1/secret/data/prod"] });
+ * ```
+ */
+export function updateDecoys(optsOrEnabled: boolean | Partial<AgentDecoyOptions>): void {
+  if (optsOrEnabled === false) {
+    // Disable: remove DOM elements and update opts so future installs skip.
+    _removeAgentDecoys();
+    _opts = { ..._opts, agentDecoys: false };
+    return;
+  }
+
+  if (optsOrEnabled === true) {
+    // Re-enable with existing config.
+    const current = _opts.agentDecoys;
+    _opts = {
+      ..._opts,
+      agentDecoys: typeof current === "object" ? { ...current, enabled: true } : true,
+    };
+    _installAgentDecoys();
+    return;
+  }
+
+  // Partial options: merge, tear down, and reinstall.
+  const current = typeof _opts.agentDecoys === "object" && _opts.agentDecoys !== null
+    ? _opts.agentDecoys
+    : {};
+  _opts = { ..._opts, agentDecoys: { ...current, ...optsOrEnabled } };
+  _removeAgentDecoys();
+  _installAgentDecoys();
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +559,243 @@ function _patchXHR(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Agent decoys
+// ---------------------------------------------------------------------------
+//
+// Agents that mine SPA bundles or the live DOM look for API paths, tokens,
+// and credentials. We inject a runtime-randomized manifest that surfaces
+// realistic-looking breadcrumbs. Each breadcrumb maps to a path the proxy
+// is actively tarpitting (from /__veilgate/.well-known tarpit.paths), so
+// agents that follow the trail receive a convincing fake response while
+// burning time in the tarpit instead of probing real endpoints.
+
+interface AgentDecoyManifest {
+  build: string;
+  apiBase: string;
+  endpoints: string[];
+  openapi: string;
+  debugPanel: string;
+  adminToken: string;
+  session: string;
+}
+
+let _decoysInstalled = false;
+// Suffix used for the last install — needed to remove injected elements.
+let _decoyElementSuffix: string | null = null;
+
+// Broad pool of realistic bait paths across many service categories.
+// The SDK picks a random subset per page load; the proxy operator can
+// replace this entirely via decoy_paths in veilgate.yaml.
+const DEFAULT_DECOY_ENDPOINTS: string[] = [
+  // SSRF / cloud-metadata
+  "/api/v1/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+  "/api/proxy?target=http://169.254.169.254/latest/user-data",
+  "/api/v1/ssrf-check?endpoint=http://metadata.google.internal/computeMetadata/v1/",
+  // Secrets and config files
+  "/.env.local",
+  "/.env.production",
+  "/config/secrets.yml",
+  "/config/master.key",
+  "/app/config/database.yml",
+  // Git / VCS
+  "/.git/config",
+  "/.git/HEAD",
+  "/.github/workflows/deploy.yml",
+  // Admin / debug panels
+  "/api/internal/debug",
+  "/api/internal/rpc",
+  "/api/internal/profiler",
+  "/prisma-studio",
+  "/graphql?explorer=1",
+  "/graphiql",
+  "/telescope",
+  "/horizon",
+  "/django/admin/login/",
+  "/rails/info/properties",
+  // OpenAPI / API docs
+  "/api/docs/openapi.json",
+  "/swagger-ui.html",
+  "/swagger.json",
+  "/api-docs",
+  // Spring Boot Actuator
+  "/actuator/env",
+  "/actuator/heapdump",
+  "/actuator/mappings",
+  "/actuator/loggers",
+  // HashiCorp Vault / Consul
+  "/v1/secret/data/prod",
+  "/v1/auth/token/lookup-self",
+  "/v1/sys/mounts",
+  "/consul/v1/kv/?recurse=true",
+  // Kubernetes-style
+  "/api/v1/secrets",
+  "/api/v1/pods",
+  // Database / search
+  "/_cat/indices?v",
+  "/_nodes/stats",
+  "/kibana/api/index_patterns",
+  // Monitoring / observability
+  "/__grafana/api/datasources/proxy/1/query",
+  "/prometheus/api/v1/targets",
+  "/__webpack_hmr",
+  // Payment / OAuth
+  "/api/webhooks/stripe/test",
+  "/api/billing/stripe-connect",
+  "/oauth2/token",
+  "/.well-known/jwks.json",
+  // AI / ML proxies (common scraping target)
+  "/api/ai/completions",
+  "/v1/models",
+  // CI / deploy artifacts
+  "/bitbucket-pipelines.yml",
+  "/Jenkinsfile",
+  "/deploy/keys/id_rsa",
+];
+
+function _installAgentDecoys(): void {
+  if (_decoysInstalled || typeof document === "undefined") return;
+  const cfg = _resolveDecoyConfig();
+  if (!cfg.enabled) return;
+  _decoysInstalled = true;
+
+  const manifest = _buildManifest(cfg);
+  const suffix = _randomBase64Url(8);
+  _decoyElementSuffix = suffix;
+  const id = `${cfg.elementPrefix}-${suffix}`;
+
+  // Inject a <script type="application/json"> so DOM-scraping agents see it.
+  const script = document.createElement("script");
+  script.id = id;
+  script.type = "application/json";
+  script.setAttribute("data-vg-runtime", suffix);
+  script.textContent = JSON.stringify(manifest);
+  document.head.appendChild(script);
+
+  // Inject a <meta> tag for agents that scan meta elements.
+  const meta = document.createElement("meta");
+  meta.name = `${cfg.elementPrefix}-build`;
+  meta.setAttribute("data-vg-runtime", suffix);
+  meta.content = `${manifest.build}:${manifest.openapi}`;
+  document.head.appendChild(meta);
+
+  // Non-enumerable window property: visible to property-enumerating agents
+  // but invisible to Object.keys() so it doesn't pollute real code.
+  const globalName = `__VG_${suffix.replace(/-/g, "_")}__`;
+  try {
+    Object.defineProperty(window, globalName, {
+      configurable: false,
+      enumerable: false,
+      value: Object.freeze(manifest),
+    });
+  } catch {
+    // Non-critical; DOM metadata alone is sufficient for most scraping agents.
+  }
+}
+
+function _removeAgentDecoys(): void {
+  if (typeof document === "undefined") return;
+  if (_decoyElementSuffix !== null) {
+    document.querySelectorAll(`[data-vg-runtime="${_decoyElementSuffix}"]`).forEach((el) => el.remove());
+  }
+  _decoyElementSuffix = null;
+  _decoysInstalled = false;
+}
+
+function _resolveDecoyConfig(): Required<AgentDecoyOptions> {
+  const raw = _opts.agentDecoys;
+  const overrides = typeof raw === "object" && raw !== null ? raw : {};
+
+  // Server-provided tarpit paths take precedence over the built-in pool
+  // so every injected breadcrumb maps to a real tarpit endpoint.
+  const serverPaths = _discovery?.tarpit?.paths?.map((e) => e.path) ?? [];
+  const endpointPool =
+    overrides.endpoints ??
+    (serverPaths.length > 0 ? serverPaths : DEFAULT_DECOY_ENDPOINTS);
+
+  return {
+    enabled: raw !== false && overrides.enabled !== false,
+    apiBase: overrides.apiBase ?? "/api",
+    endpointCount: Math.max(1, overrides.endpointCount ?? 5),
+    elementPrefix: overrides.elementPrefix ?? "vg-app-manifest",
+    endpoints: endpointPool,
+  };
+}
+
+function _buildManifest(cfg: Required<AgentDecoyOptions>): AgentDecoyManifest {
+  const endpoints = _pickRandom(cfg.endpoints, cfg.endpointCount);
+  const apiBase = cfg.apiBase.replace(/\/$/, "");
+  return {
+    build: _randomHex(12),
+    apiBase,
+    endpoints,
+    openapi: `${apiBase}/docs/openapi.json`,
+    debugPanel: `${apiBase}/internal/debug`,
+    adminToken: _fakeJWT("admin"),
+    session: _fakeSession(),
+  };
+}
+
+function _pickRandom(pool: string[], count: number): string[] {
+  const src = [...pool];
+  const out: string[] = [];
+  while (src.length > 0 && out.length < count) {
+    const i = _randomInt(src.length);
+    out.push(src.splice(i, 1)[0]);
+  }
+  return out;
+}
+
+function _fakeJWT(role: string): string {
+  const now = Math.floor(Date.now() / 1000);
+  const hdr = _b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const pay = _b64url(JSON.stringify({
+    sub: `usr_${_randomBase64Url(10)}`,
+    role,
+    iat: now - _randomInt(3600),
+    exp: now + 86400 + _randomInt(86400),
+    jti: _randomHex(16),
+  }));
+  return `${hdr}.${pay}.${_randomBase64Url(32)}`;
+}
+
+function _fakeSession(): string {
+  return `s%3A${_randomHex(16)}.${_randomBase64Url(27)}`;
+}
+
+function _randomInt(max: number): number {
+  if (max <= 0) return 0;
+  const b = new Uint32Array(1);
+  _crypto().getRandomValues(b);
+  return b[0] % max;
+}
+
+function _randomHex(bytes: number): string {
+  const b = new Uint8Array(bytes);
+  _crypto().getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function _randomBase64Url(bytes: number): string {
+  const b = new Uint8Array(bytes);
+  _crypto().getRandomValues(b);
+  let s = "";
+  for (const x of b) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function _b64url(s: string): string {
+  return btoa(unescape(encodeURIComponent(s)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function _crypto(): Crypto {
+  if (typeof crypto !== "undefined") return crypto;
+  throw new Error("veilgate: crypto.getRandomValues unavailable");
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -477,6 +815,7 @@ export function _reset(): void {
     storageKey: DEFAULT_STORAGE_KEY,
     onChallenge: () => undefined,
     onToken: () => undefined,
+    agentDecoys: true,
   };
   _discovery = null;
   _discoveryPromise = null;
@@ -487,6 +826,7 @@ export function _reset(): void {
   _prePatchFetch = null;
   _fetchPatched = false;
   _xhrPatched = false;
+  _removeAgentDecoys();
   _internal.iframeLoader = _defaultIframeLoader;
   _memStorage.clear();
 }
