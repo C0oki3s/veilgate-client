@@ -21,7 +21,7 @@ import {
 function makeToken(overrides?: Partial<StoredToken>): StoredToken {
   return {
     value: "test-token-abc123",
-    header: "X-Veilgate-Token",
+    header: "X-App-Token",
     expiresAt: Date.now() + 1_800_000,
     ...overrides,
   };
@@ -30,10 +30,10 @@ function makeToken(overrides?: Partial<StoredToken>): StoredToken {
 function makeDiscovery(overrides?: Partial<DiscoveryDoc["challenge"]>): DiscoveryDoc {
   return {
     challenge: {
-      verify_path: "/__veilgate/verify",
-      start_path: "/__veilgate/start",
-      token_header: "X-Veilgate-Token",
-      cookie_name: "veilgate_pow",
+      verify_path: "/_g/verify",
+      start_path: "/_g/start",
+      token_header: "X-App-Token",
+      cookie_name: "__app_ts",
       ...overrides,
     },
   };
@@ -100,7 +100,7 @@ describe("token storage", () => {
 // ---------------------------------------------------------------------------
 
 describe("init()", () => {
-  it("fetches /__veilgate/.well-known and caches it", async () => {
+  it("fetches /_g/config and caches it", async () => {
     const doc = makeDiscovery();
     global.fetch = makeFetchMock(200, doc) as unknown as typeof fetch;
     await init();
@@ -119,7 +119,7 @@ describe("init()", () => {
     global.fetch = spy as unknown as typeof fetch;
     await init({ baseURL: "https://api.example.com" });
     expect(spy).toHaveBeenCalledWith(
-      "https://api.example.com/__veilgate/.well-known",
+      "https://api.example.com/_g/config",
       expect.objectContaining({ credentials: "omit" }),
     );
   });
@@ -131,6 +131,29 @@ describe("init()", () => {
     await init();
     // Discovery promise is reused; fetch called only once.
     expect(spy).toHaveBeenCalledOnce();
+  });
+
+  it("does not inject a built-in endpoint list when discovery has no routes", async () => {
+    global.fetch = makeFetchMock(200, makeDiscovery()) as unknown as typeof fetch;
+    await init();
+
+    const el = document.querySelector('script[type="application/json"][data-app-build]');
+    expect(el).not.toBeNull();
+    const manifest = JSON.parse(el!.textContent ?? "{}") as { endpoints: string[] };
+    expect(manifest.endpoints).toEqual([]);
+  });
+
+  it("renders endpoints from discovery routes", async () => {
+    global.fetch = makeFetchMock(200, {
+      ...makeDiscovery(),
+      routes: { paths: [{ path: "/api/status", service: "api" }] },
+    }) as unknown as typeof fetch;
+    await init();
+
+    const el = document.querySelector('script[type="application/json"][data-app-build]');
+    expect(el).not.toBeNull();
+    const manifest = JSON.parse(el!.textContent ?? "{}") as { endpoints: string[] };
+    expect(manifest.endpoints).toEqual(["/api/status"]);
   });
 });
 
@@ -178,7 +201,76 @@ describe("_solve()", () => {
 
     await _solve();
     expect(onChallenge).toHaveBeenCalledOnce();
-    expect(onToken).toHaveBeenCalledWith("test-token-abc123", "X-Veilgate-Token");
+    expect(onToken).toHaveBeenCalledWith("test-token-abc123", "X-App-Token");
+  });
+
+  it("shows and hides the built-in verification UI during a solve", async () => {
+    global.fetch = makeFetchMock(200, makeDiscovery()) as unknown as typeof fetch;
+    await init();
+
+    let resolveLoader!: (value: StoredToken) => void;
+    _internal.iframeLoader = vi.fn().mockImplementation(() => new Promise<StoredToken>((resolve) => {
+      resolveLoader = resolve;
+    }));
+
+    const solving = _solve();
+    await Promise.resolve();
+
+    const overlay = document.getElementById("veilgate-verification") as HTMLDivElement | null;
+    expect(overlay).not.toBeNull();
+    expect(overlay!.hidden).toBe(false);
+    expect(overlay!.style.background).toBe("rgba(255, 255, 255, 0.82)");
+    expect(overlay!.querySelector(".veilgate-verification__title")?.textContent).toBe("Verifying your browser");
+    expect((overlay!.querySelector(".veilgate-verification__title") as HTMLElement).style.color).toBe("rgb(0, 0, 0)");
+
+    resolveLoader(makeToken());
+    await solving;
+    expect(overlay!.hidden).toBe(true);
+  });
+
+  it("applies custom built-in verification UI colors and copy", async () => {
+    global.fetch = makeFetchMock(200, makeDiscovery()) as unknown as typeof fetch;
+    await init({
+      verificationUI: {
+        title: "Checking session",
+        message: "One moment",
+        overlayColor: "rgba(0, 0, 0, 0.5)",
+        panelColor: "#111111",
+        textColor: "#ffffff",
+        mutedTextColor: "#cccccc",
+        spinnerColor: "#ff0000",
+        spinnerTrackColor: "#333333",
+        borderColor: "#444444",
+        zIndex: 1000,
+      },
+    });
+
+    let resolveLoader!: (value: StoredToken) => void;
+    _internal.iframeLoader = vi.fn().mockImplementation(() => new Promise<StoredToken>((resolve) => {
+      resolveLoader = resolve;
+    }));
+
+    const solving = _solve();
+    await Promise.resolve();
+
+    const overlay = document.getElementById("veilgate-verification") as HTMLDivElement;
+    const panel = overlay.querySelector(".veilgate-verification__panel") as HTMLElement;
+    const spinner = overlay.querySelector(".veilgate-verification__spinner") as HTMLElement;
+    const title = overlay.querySelector(".veilgate-verification__title") as HTMLElement;
+    const message = overlay.querySelector(".veilgate-verification__message") as HTMLElement;
+
+    expect(overlay.style.zIndex).toBe("1000");
+    expect(overlay.style.background).toBe("rgba(0, 0, 0, 0.5)");
+    expect(panel.style.background).toBe("rgb(17, 17, 17)");
+    expect(panel.style.borderColor).toBe("rgb(68, 68, 68)");
+    expect(spinner.style.borderTopColor).toBe("rgb(255, 0, 0)");
+    expect(title.textContent).toBe("Checking session");
+    expect(title.style.color).toBe("rgb(255, 255, 255)");
+    expect(message.textContent).toBe("One moment");
+    expect(message.style.color).toBe("rgb(204, 204, 204)");
+
+    resolveLoader(makeToken());
+    await solving;
   });
 
   it("passes the origin param to the iframe src", async () => {
@@ -213,7 +305,7 @@ describe("handleAll() fetch interceptor", () => {
     expect(spy).toHaveBeenCalledOnce();
     const [, init] = spy.mock.calls[0] as [unknown, RequestInit];
     const headers = new Headers(init?.headers);
-    expect(headers.get("X-Veilgate-Token")).toBe("test-token-abc123");
+    expect(headers.get("X-App-Token")).toBe("test-token-abc123");
   });
 
   it("does not attach an expired token", async () => {
@@ -226,7 +318,7 @@ describe("handleAll() fetch interceptor", () => {
 
     const [, init] = spy.mock.calls[0] as [unknown, RequestInit];
     const headers = new Headers(init?.headers);
-    expect(headers.get("X-Veilgate-Token")).toBeNull();
+    expect(headers.get("X-App-Token")).toBeNull();
   });
 
   it("solves challenge and retries on 401 challenge_required", async () => {

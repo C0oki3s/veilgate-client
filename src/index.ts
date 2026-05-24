@@ -39,29 +39,18 @@ export interface VeilGateOptions {
    */
   onToken?: (token: string, header: string) => void;
 
-  /**
-   * Defensive agent-decoy material for SPA/bundle-mining scanners.
-   *
-   * When enabled the SDK injects a runtime-randomized metadata block into
-   * the DOM and exposes a non-enumerable window hint. Browser users never
-   * see it, but agents that scrape DOM/source/bundle content discover
-   * realistic endpoint breadcrumbs that route to VeilGate's tarpit.
-   *
-   * Paths are sourced from the /__veilgate/.well-known tarpit block first
-   * (set by the proxy operator) so every breadcrumb maps to a path the
-   * server is actively tarpitting. Falls back to built-in defaults when
-   * the server hasn't configured decoy_paths.
-   *
-   * Set false to disable. Default: true.
-   */
-  agentDecoys?: boolean | AgentDecoyOptions;
+  /** Inject runtime metadata into the DOM. Set false to disable. Default: true. */
+  breadcrumbs?: boolean | BreadcrumbOptions;
+
+  /** Built-in verification overlay. Set false to disable. Default: true. */
+  verificationUI?: boolean | VerificationUIOptions;
 }
 
-export interface AgentDecoyOptions {
-  /** Enable/disable all decoys. Default: true. */
+export interface BreadcrumbOptions {
+  /** Enable/disable breadcrumb injection. Default: true. */
   enabled?: boolean;
 
-  /** Prefix for bait API paths injected into the manifest. Default: "/api". */
+  /** Prefix for injected API paths in the manifest. Default: "/api". */
   apiBase?: string;
 
   /** How many endpoint hints to expose per page load. Default: 5. */
@@ -72,14 +61,49 @@ export interface AgentDecoyOptions {
 
   /**
    * Override the endpoint pool entirely. When omitted the SDK uses the
-   * server-provided tarpit paths from .well-known, or the built-in pool.
+   * server-provided route manifest paths from /_g/config.
    */
   endpoints?: string[];
 }
 
-export interface TarpitPathEntry {
+export interface VerificationUIOptions {
+  /** Enable/disable the built-in overlay. Default: true. */
+  enabled?: boolean;
+
+  /** Main overlay copy. Default: "Verifying your browser". */
+  title?: string;
+
+  /** Secondary overlay copy. Default: "This usually takes a moment." */
+  message?: string;
+
+  /** Full-screen overlay background. Default: "rgba(255, 255, 255, 0.82)". */
+  overlayColor?: string;
+
+  /** Panel background. Default: "#ffffff". */
+  panelColor?: string;
+
+  /** Primary text color. Default: "#000000". */
+  textColor?: string;
+
+  /** Secondary text color. Default: "#3f3f46". */
+  mutedTextColor?: string;
+
+  /** Spinner active segment color. Default: "#000000". */
+  spinnerColor?: string;
+
+  /** Spinner track color. Default: "#e4e4e7". */
+  spinnerTrackColor?: string;
+
+  /** Panel border color. Default: "#d4d4d8". */
+  borderColor?: string;
+
+  /** Overlay z-index. Default: 2147483647. */
+  zIndex?: number;
+}
+
+export interface RoutePathEntry {
   path: string;
-  /** Human-readable service label set by the proxy operator, e.g. "vault", "stripe". */
+  /** Human-readable service label set by the proxy operator, e.g. "api", "dashboard". */
   service?: string;
 }
 
@@ -98,12 +122,12 @@ export interface DiscoveryDoc {
     validator?: string;
   }>;
   /**
-   * Bait endpoints the proxy is actively tarpitting. When present the SDK
-   * uses these paths as DOM decoys so every agent breadcrumb routes to a
-   * realistic tarpit response rather than a real 404.
+   * Registered routes from the proxy manifest. When present the SDK
+   * injects these paths into runtime metadata so linked previews resolve
+   * through the configured handler instead of a real 404.
    */
-  tarpit?: {
-    paths: TarpitPathEntry[];
+  routes?: {
+    paths: RoutePathEntry[];
   };
 }
 
@@ -118,7 +142,7 @@ export interface StoredToken {
 // State
 // ---------------------------------------------------------------------------
 
-const DISCOVERY_PATH = "/__veilgate/.well-known";
+const DISCOVERY_PATH = "/_g/config";
 const DEFAULT_STORAGE_KEY = "vg_token";
 // Renew the token when less than 60 s remain, not at the last moment.
 const RENEW_BEFORE_MS = 60_000;
@@ -128,7 +152,8 @@ let _opts: Required<VeilGateOptions> = {
   storageKey: DEFAULT_STORAGE_KEY,
   onChallenge: () => undefined,
   onToken: () => undefined,
-  agentDecoys: true,
+  breadcrumbs: true,
+  verificationUI: true,
 };
 
 let _discovery: DiscoveryDoc | null = null;
@@ -142,7 +167,7 @@ let _solvePromise: Promise<StoredToken> | null = null;
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch the /__veilgate/.well-known discovery document and warm up the
+ * Fetch the /_g/config discovery document and warm up the
  * internal state. Call once during application start-up.
  *
  * Safe to call multiple times; subsequent calls are no-ops unless the
@@ -151,7 +176,7 @@ let _solvePromise: Promise<StoredToken> | null = null;
 export async function init(opts?: VeilGateOptions): Promise<void> {
   _mergeOpts(opts);
   _discovery = await _ensureDiscovery();
-  _installAgentDecoys();
+  _installBreadcrumbs();
 }
 
 /**
@@ -166,7 +191,7 @@ export function handleAll(opts?: VeilGateOptions): void {
   _mergeOpts(opts);
   _patchFetch();
   _patchXHR();
-  _installAgentDecoys();
+  _installBreadcrumbs();
 }
 
 /**
@@ -191,50 +216,50 @@ export function getDiscovery(): DiscoveryDoc | null {
 }
 
 /**
- * Enable, disable, or reconfigure agent decoys at runtime.
+ * Enable, disable, or reconfigure breadcrumb injection at runtime.
  *
- * - `updateDecoys(false)` — remove injected DOM elements and disable decoys.
+ * - `updateBreadcrumbs(false)` — remove injected DOM elements and disable injection.
  *   Subsequent calls to init() / handleAll() will not re-inject.
- * - `updateDecoys(true)` — re-enable and (re-)inject decoys immediately.
- * - `updateDecoys({ endpointCount: 8, endpoints: [...] })` — merge new options,
+ * - `updateBreadcrumbs(true)` — re-enable and (re-)inject immediately.
+ * - `updateBreadcrumbs({ endpointCount: 8, endpoints: [...] })` — merge new options,
  *   tear down the current DOM elements, and re-inject with the new config.
  *
  * This is safe to call at any time — before or after init() / handleAll().
  *
  * ```ts
- * // Kill the decoys for this session (e.g. authenticated admin user).
- * updateDecoys(false);
+ * // Disable for this session (e.g. authenticated admin user).
+ * updateBreadcrumbs(false);
  *
  * // Swap in a custom endpoint list at runtime.
- * updateDecoys({ endpoints: ["/internal/rpc", "/v1/secret/data/prod"] });
+ * updateBreadcrumbs({ endpoints: ["/api/status", "/api/docs/openapi.json"] });
  * ```
  */
-export function updateDecoys(optsOrEnabled: boolean | Partial<AgentDecoyOptions>): void {
+export function updateBreadcrumbs(optsOrEnabled: boolean | Partial<BreadcrumbOptions>): void {
   if (optsOrEnabled === false) {
     // Disable: remove DOM elements and update opts so future installs skip.
-    _removeAgentDecoys();
-    _opts = { ..._opts, agentDecoys: false };
+    _removeBreadcrumbs();
+    _opts = { ..._opts, breadcrumbs: false };
     return;
   }
 
   if (optsOrEnabled === true) {
     // Re-enable with existing config.
-    const current = _opts.agentDecoys;
+    const current = _opts.breadcrumbs;
     _opts = {
       ..._opts,
-      agentDecoys: typeof current === "object" ? { ...current, enabled: true } : true,
+      breadcrumbs: typeof current === "object" ? { ...current, enabled: true } : true,
     };
-    _installAgentDecoys();
+    _installBreadcrumbs();
     return;
   }
 
   // Partial options: merge, tear down, and reinstall.
-  const current = typeof _opts.agentDecoys === "object" && _opts.agentDecoys !== null
-    ? _opts.agentDecoys
+  const current = typeof _opts.breadcrumbs === "object" && _opts.breadcrumbs !== null
+    ? _opts.breadcrumbs
     : {};
-  _opts = { ..._opts, agentDecoys: { ...current, ...optsOrEnabled } };
-  _removeAgentDecoys();
-  _installAgentDecoys();
+  _opts = { ..._opts, breadcrumbs: { ...current, ...optsOrEnabled } };
+  _removeBreadcrumbs();
+  _installBreadcrumbs();
 }
 
 // ---------------------------------------------------------------------------
@@ -333,17 +358,20 @@ export function _solve(): Promise<StoredToken> {
       if (!doc?.challenge) {
         throw new Error("veilgate: discovery missing challenge config; call init() first");
       }
-      const startPath = doc.challenge.start_path ?? "/__veilgate/start";
+      const startPath = doc.challenge.start_path ?? "/_g/start";
       const origin =
         typeof window !== "undefined" ? window.location.origin : "";
       const src =
         _opts.baseURL + startPath + "?origin=" + encodeURIComponent(origin);
+      _showVerificationUI();
       _opts.onChallenge();
       const token = await _internal.iframeLoader(src, doc.challenge.token_header);
       _saveToken(token);
+      _hideVerificationUI();
       _opts.onToken(token.value, token.header);
       return token;
     } finally {
+      _hideVerificationUI();
       _solvePromise = null;
     }
   })();
@@ -559,169 +587,333 @@ function _patchXHR(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Agent decoys
+// Verification UI
 // ---------------------------------------------------------------------------
-//
-// Agents that mine SPA bundles or the live DOM look for API paths, tokens,
-// and credentials. We inject a runtime-randomized manifest that surfaces
-// realistic-looking breadcrumbs. Each breadcrumb maps to a path the proxy
-// is actively tarpitting (from /__veilgate/.well-known tarpit.paths), so
-// agents that follow the trail receive a convincing fake response while
-// burning time in the tarpit instead of probing real endpoints.
 
-interface AgentDecoyManifest {
+let _verificationEl: HTMLDivElement | null = null;
+let _verificationStyleEl: HTMLStyleElement | null = null;
+
+function _resolveVerificationUIConfig(): Required<VerificationUIOptions> {
+  const raw = _opts.verificationUI;
+  const overrides = typeof raw === "object" && raw !== null ? raw : {};
+
+  return {
+    enabled: raw !== false && overrides.enabled !== false,
+    title: overrides.title ?? "Verifying your browser",
+    message: overrides.message ?? "This usually takes a moment.",
+    overlayColor: overrides.overlayColor ?? "rgba(255, 255, 255, 0.82)",
+    panelColor: overrides.panelColor ?? "#ffffff",
+    textColor: overrides.textColor ?? "#000000",
+    mutedTextColor: overrides.mutedTextColor ?? "#3f3f46",
+    spinnerColor: overrides.spinnerColor ?? "#000000",
+    spinnerTrackColor: overrides.spinnerTrackColor ?? "#e4e4e7",
+    borderColor: overrides.borderColor ?? "#d4d4d8",
+    zIndex: overrides.zIndex ?? 2147483647,
+  };
+}
+
+function _showVerificationUI(): void {
+  if (typeof document === "undefined") return;
+  const cfg = _resolveVerificationUIConfig();
+  if (!cfg.enabled) return;
+
+  const overlay = _ensureVerificationUI(cfg);
+  _applyVerificationUIConfig(overlay, cfg);
+  overlay.hidden = false;
+}
+
+function _hideVerificationUI(): void {
+  if (_verificationEl) {
+    _verificationEl.hidden = true;
+  }
+}
+
+function _ensureVerificationUI(cfg: Required<VerificationUIOptions>): HTMLDivElement {
+  if (_verificationEl && document.body.contains(_verificationEl)) {
+    return _verificationEl;
+  }
+
+  _ensureVerificationStyles();
+
+  const overlay = document.createElement("div");
+  overlay.id = "veilgate-verification";
+  overlay.className = "veilgate-verification";
+  overlay.hidden = true;
+  overlay.setAttribute("role", "status");
+  overlay.setAttribute("aria-live", "polite");
+
+  const panel = document.createElement("div");
+  panel.className = "veilgate-verification__panel";
+
+  const spinner = document.createElement("div");
+  spinner.className = "veilgate-verification__spinner";
+  spinner.setAttribute("aria-hidden", "true");
+
+  const title = document.createElement("p");
+  title.className = "veilgate-verification__title";
+
+  const message = document.createElement("p");
+  message.className = "veilgate-verification__message";
+
+  panel.appendChild(spinner);
+  panel.appendChild(title);
+  panel.appendChild(message);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  _verificationEl = overlay;
+  _applyVerificationUIConfig(overlay, cfg);
+  return overlay;
+}
+
+function _ensureVerificationStyles(): void {
+  if (_verificationStyleEl && document.head.contains(_verificationStyleEl)) return;
+
+  const style = document.createElement("style");
+  style.id = "veilgate-verification-style";
+  style.textContent = `
+.veilgate-verification {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  backdrop-filter: blur(8px);
+}
+.veilgate-verification[hidden] {
+  display: none;
+}
+.veilgate-verification__panel {
+  width: min(360px, 100%);
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  padding: 24px;
+  border: 1px solid;
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, .14);
+  text-align: center;
+}
+.veilgate-verification__spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid;
+  border-radius: 50%;
+  animation: veilgate-verification-spin .8s linear infinite;
+}
+.veilgate-verification__title {
+  margin: 0;
+  font: 650 16px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.veilgate-verification__message {
+  margin: 0;
+  font: 400 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+@keyframes veilgate-verification-spin {
+  to { transform: rotate(360deg); }
+}`;
+  document.head.appendChild(style);
+  _verificationStyleEl = style;
+}
+
+function _applyVerificationUIConfig(
+  overlay: HTMLDivElement,
+  cfg: Required<VerificationUIOptions>,
+): void {
+  const panel = overlay.querySelector<HTMLElement>(".veilgate-verification__panel");
+  const spinner = overlay.querySelector<HTMLElement>(".veilgate-verification__spinner");
+  const title = overlay.querySelector<HTMLElement>(".veilgate-verification__title");
+  const message = overlay.querySelector<HTMLElement>(".veilgate-verification__message");
+
+  overlay.style.zIndex = String(cfg.zIndex);
+  overlay.style.background = cfg.overlayColor;
+
+  if (panel) {
+    panel.style.background = cfg.panelColor;
+    panel.style.borderColor = cfg.borderColor;
+  }
+  if (spinner) {
+    spinner.style.borderColor = cfg.spinnerTrackColor;
+    spinner.style.borderTopColor = cfg.spinnerColor;
+  }
+  if (title) {
+    title.textContent = cfg.title;
+    title.style.color = cfg.textColor;
+  }
+  if (message) {
+    message.textContent = cfg.message;
+    message.style.color = cfg.mutedTextColor;
+  }
+}
+
+function _removeVerificationUI(): void {
+  _verificationEl?.remove();
+  _verificationStyleEl?.remove();
+  _verificationEl = null;
+  _verificationStyleEl = null;
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumb injection
+// ---------------------------------------------------------------------------
+
+interface AppManifest {
   build: string;
   apiBase: string;
   endpoints: string[];
   openapi: string;
-  debugPanel: string;
-  adminToken: string;
+  status: string;
+  traceId: string;
   session: string;
 }
 
-let _decoysInstalled = false;
-// Suffix used for the last install — needed to remove injected elements.
-let _decoyElementSuffix: string | null = null;
+let _breadcrumbsInstalled = false;
+let _elementSuffix: string | null = null;
 
-// Broad pool of realistic bait paths across many service categories.
-// The SDK picks a random subset per page load; the proxy operator can
-// replace this entirely via decoy_paths in veilgate.yaml.
-const DEFAULT_DECOY_ENDPOINTS: string[] = [
-  // SSRF / cloud-metadata
-  "/api/v1/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-  "/api/proxy?target=http://169.254.169.254/latest/user-data",
-  "/api/v1/ssrf-check?endpoint=http://metadata.google.internal/computeMetadata/v1/",
-  // Secrets and config files
-  "/.env.local",
-  "/.env.production",
-  "/config/secrets.yml",
-  "/config/master.key",
-  "/app/config/database.yml",
-  // Git / VCS
-  "/.git/config",
-  "/.git/HEAD",
-  "/.github/workflows/deploy.yml",
-  // Admin / debug panels
-  "/api/internal/debug",
-  "/api/internal/rpc",
-  "/api/internal/profiler",
-  "/prisma-studio",
-  "/graphql?explorer=1",
-  "/graphiql",
-  "/telescope",
-  "/horizon",
-  "/django/admin/login/",
-  "/rails/info/properties",
-  // OpenAPI / API docs
-  "/api/docs/openapi.json",
-  "/swagger-ui.html",
-  "/swagger.json",
-  "/api-docs",
-  // Spring Boot Actuator
-  "/actuator/env",
-  "/actuator/heapdump",
-  "/actuator/mappings",
-  "/actuator/loggers",
-  // HashiCorp Vault / Consul
-  "/v1/secret/data/prod",
-  "/v1/auth/token/lookup-self",
-  "/v1/sys/mounts",
-  "/consul/v1/kv/?recurse=true",
-  // Kubernetes-style
-  "/api/v1/secrets",
-  "/api/v1/pods",
-  // Database / search
-  "/_cat/indices?v",
-  "/_nodes/stats",
-  "/kibana/api/index_patterns",
-  // Monitoring / observability
-  "/__grafana/api/datasources/proxy/1/query",
-  "/prometheus/api/v1/targets",
-  "/__webpack_hmr",
-  // Payment / OAuth
-  "/api/webhooks/stripe/test",
-  "/api/billing/stripe-connect",
-  "/oauth2/token",
-  "/.well-known/jwks.json",
-  // AI / ML proxies (common scraping target)
-  "/api/ai/completions",
-  "/v1/models",
-  // CI / deploy artifacts
-  "/bitbucket-pipelines.yml",
-  "/Jenkinsfile",
-  "/deploy/keys/id_rsa",
-];
-
-function _installAgentDecoys(): void {
-  if (_decoysInstalled || typeof document === "undefined") return;
-  const cfg = _resolveDecoyConfig();
+function _installBreadcrumbs(): void {
+  if (_breadcrumbsInstalled || typeof document === "undefined") return;
+  const cfg = _resolveConfig();
   if (!cfg.enabled) return;
-  _decoysInstalled = true;
+  _breadcrumbsInstalled = true;
 
   const manifest = _buildManifest(cfg);
   const suffix = _randomBase64Url(8);
-  _decoyElementSuffix = suffix;
+  _elementSuffix = suffix;
   const id = `${cfg.elementPrefix}-${suffix}`;
 
-  // Inject a <script type="application/json"> so DOM-scraping agents see it.
   const script = document.createElement("script");
   script.id = id;
   script.type = "application/json";
-  script.setAttribute("data-vg-runtime", suffix);
+  script.setAttribute("data-app-build", suffix);
   script.textContent = JSON.stringify(manifest);
   document.head.appendChild(script);
 
-  // Inject a <meta> tag for agents that scan meta elements.
   const meta = document.createElement("meta");
   meta.name = `${cfg.elementPrefix}-build`;
-  meta.setAttribute("data-vg-runtime", suffix);
+  meta.setAttribute("data-app-build", suffix);
   meta.content = `${manifest.build}:${manifest.openapi}`;
   document.head.appendChild(meta);
 
-  // Non-enumerable window property: visible to property-enumerating agents
-  // but invisible to Object.keys() so it doesn't pollute real code.
-  const globalName = `__VG_${suffix.replace(/-/g, "_")}__`;
+  const comment = document.createComment(_buildBuildComment(manifest, suffix));
+  document.head.appendChild(comment);
+
+  const jsonLd = document.createElement("script");
+  jsonLd.type = "application/ld+json";
+  jsonLd.setAttribute("data-app-build", suffix);
+  jsonLd.textContent = JSON.stringify(_buildJsonLd(manifest));
+  document.head.appendChild(jsonLd);
+
+  const globalName = `__APP_${suffix.replace(/-/g, "_")}__`;
   try {
     Object.defineProperty(window, globalName, {
       configurable: false,
       enumerable: false,
       value: Object.freeze(manifest),
     });
-  } catch {
-    // Non-critical; DOM metadata alone is sufficient for most scraping agents.
+  } catch { /* non-critical */ }
+
+  if (typeof document.body !== "undefined" && document.body) {
+    const panel = _buildUIPanel(manifest, suffix, cfg.elementPrefix);
+    document.body.appendChild(panel);
   }
 }
 
-function _removeAgentDecoys(): void {
+function _buildBuildComment(m: AppManifest, suffix: string): string {
+  const ep = m.endpoints[0] ?? m.status;
+  const ts = new Date(Date.now() - _randomInt(3600) * 1000).toISOString();
+  const variants = [
+    ` build:${m.build} trace:${m.traceId} route:${ep} openapi:${m.openapi} `,
+    ` build-meta: v${m.build} | api-root: ${m.apiBase} | status: ${m.status} | session: ${m.session} `,
+    ` release-note: route ${ep} verified at ${ts.slice(0, 10)} trace=${m.traceId} `,
+    ` runtime: api-base=${m.apiBase} status=${m.status} docs=${m.openapi} build=${suffix} `,
+  ];
+  return variants[_randomInt(variants.length)];
+}
+
+function _buildJsonLd(m: AppManifest): object {
+  return {
+    "@context": "https://schema.org",
+    "@type": "WebAPI",
+    "name": "Internal Service API",
+    "documentation": m.openapi,
+    "endpointURL": m.apiBase,
+    "description": `Service API metadata for ${m.status}`,
+    "potentialAction": m.endpoints.map(ep => ({
+      "@type": "ReadAction",
+      "target": ep,
+    })),
+  };
+}
+
+function _buildUIPanel(m: AppManifest, suffix: string, prefix: string): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.id = `${prefix}-panel-${suffix}`;
+  wrap.setAttribute("data-app-build", suffix);
+  wrap.setAttribute("aria-hidden", "true");
+  wrap.setAttribute("role", "navigation");
+  wrap.setAttribute("aria-label", "Internal navigation");
+  wrap.style.cssText =
+    "position:absolute;width:1px;height:1px;padding:0;margin:-1px;" +
+    "overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0";
+
+  const label = document.createElement("span");
+  label.textContent = `build:${m.build}`;
+  label.setAttribute("data-trace", m.traceId);
+  label.setAttribute("data-session", m.session);
+  wrap.appendChild(label);
+
+  const nav = document.createElement("nav");
+  for (const ep of m.endpoints) {
+    const a = document.createElement("a");
+    a.href = ep;
+    a.setAttribute("data-svc", ep.split("/")[2] ?? "api");
+    a.textContent = ep;
+    nav.appendChild(a);
+  }
+  for (const href of [m.openapi, m.status]) {
+    const a = document.createElement("a");
+    a.href = href;
+    a.rel = "nofollow";
+    a.textContent = href;
+    nav.appendChild(a);
+  }
+  wrap.appendChild(nav);
+
+  return wrap;
+}
+
+function _removeBreadcrumbs(): void {
   if (typeof document === "undefined") return;
-  if (_decoyElementSuffix !== null) {
-    document.querySelectorAll(`[data-vg-runtime="${_decoyElementSuffix}"]`).forEach((el) => el.remove());
+  if (_elementSuffix !== null) {
+    document.querySelectorAll(`[data-app-build="${_elementSuffix}"]`).forEach((el) => el.remove());
+    document.head.childNodes.forEach((node) => {
+      if (node.nodeType === Node.COMMENT_NODE) {
+        const c = node as Comment;
+        if (c.textContent?.includes(_elementSuffix!)) c.remove();
+      }
+    });
   }
-  _decoyElementSuffix = null;
-  _decoysInstalled = false;
+  _elementSuffix = null;
+  _breadcrumbsInstalled = false;
 }
 
-function _resolveDecoyConfig(): Required<AgentDecoyOptions> {
-  const raw = _opts.agentDecoys;
+function _resolveConfig(): Required<BreadcrumbOptions> {
+  const raw = _opts.breadcrumbs;
   const overrides = typeof raw === "object" && raw !== null ? raw : {};
-
-  // Server-provided tarpit paths take precedence over the built-in pool
-  // so every injected breadcrumb maps to a real tarpit endpoint.
-  const serverPaths = _discovery?.tarpit?.paths?.map((e) => e.path) ?? [];
-  const endpointPool =
-    overrides.endpoints ??
-    (serverPaths.length > 0 ? serverPaths : DEFAULT_DECOY_ENDPOINTS);
+  const manifestPaths = _discovery?.routes?.paths ?? [];
+  const serverPaths = manifestPaths.map((e) => e.path);
+  const endpointPool = overrides.endpoints ?? serverPaths;
 
   return {
     enabled: raw !== false && overrides.enabled !== false,
     apiBase: overrides.apiBase ?? "/api",
     endpointCount: Math.max(1, overrides.endpointCount ?? 5),
-    elementPrefix: overrides.elementPrefix ?? "vg-app-manifest",
+    elementPrefix: overrides.elementPrefix ?? "app-manifest",
     endpoints: endpointPool,
   };
 }
 
-function _buildManifest(cfg: Required<AgentDecoyOptions>): AgentDecoyManifest {
+function _buildManifest(cfg: Required<BreadcrumbOptions>): AppManifest {
   const endpoints = _pickRandom(cfg.endpoints, cfg.endpointCount);
   const apiBase = cfg.apiBase.replace(/\/$/, "");
   return {
@@ -729,8 +921,8 @@ function _buildManifest(cfg: Required<AgentDecoyOptions>): AgentDecoyManifest {
     apiBase,
     endpoints,
     openapi: `${apiBase}/docs/openapi.json`,
-    debugPanel: `${apiBase}/internal/debug`,
-    adminToken: _fakeJWT("admin"),
+    status: `${apiBase}/status`,
+    traceId: _randomHex(16),
     session: _fakeSession(),
   };
 }
@@ -743,19 +935,6 @@ function _pickRandom(pool: string[], count: number): string[] {
     out.push(src.splice(i, 1)[0]);
   }
   return out;
-}
-
-function _fakeJWT(role: string): string {
-  const now = Math.floor(Date.now() / 1000);
-  const hdr = _b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const pay = _b64url(JSON.stringify({
-    sub: `usr_${_randomBase64Url(10)}`,
-    role,
-    iat: now - _randomInt(3600),
-    exp: now + 86400 + _randomInt(86400),
-    jti: _randomHex(16),
-  }));
-  return `${hdr}.${pay}.${_randomBase64Url(32)}`;
 }
 
 function _fakeSession(): string {
@@ -783,13 +962,6 @@ function _randomBase64Url(bytes: number): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function _b64url(s: string): string {
-  return btoa(unescape(encodeURIComponent(s)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
 function _crypto(): Crypto {
   if (typeof crypto !== "undefined") return crypto;
   throw new Error("veilgate: crypto.getRandomValues unavailable");
@@ -815,7 +987,8 @@ export function _reset(): void {
     storageKey: DEFAULT_STORAGE_KEY,
     onChallenge: () => undefined,
     onToken: () => undefined,
-    agentDecoys: true,
+    breadcrumbs: true,
+    verificationUI: true,
   };
   _discovery = null;
   _discoveryPromise = null;
@@ -826,7 +999,8 @@ export function _reset(): void {
   _prePatchFetch = null;
   _fetchPatched = false;
   _xhrPatched = false;
-  _removeAgentDecoys();
+  _removeVerificationUI();
+  _removeBreadcrumbs();
   _internal.iframeLoader = _defaultIframeLoader;
   _memStorage.clear();
 }
